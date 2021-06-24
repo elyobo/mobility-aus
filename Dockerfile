@@ -12,7 +12,7 @@ RUN rm -rf /var/lib/apt/lists/* && apt clean && apt update && apt install -y \
   && rm -rf /var/lib/apt/lists/*
 RUN pip3 install -U --no-cache-dir \
   shapely \
-  fiona \ 
+  fiona \
   descartes \
   geopandas \
   mercantile \

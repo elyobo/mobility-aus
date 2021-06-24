@@ -1,17 +1,12 @@
 #!/bin/bash
 currentDir=$PWD
 cd "$(dirname "$0")"
-sudo chown -R ubuntu $PWD/.git
-sudo chgrp -R ubuntu $PWD/.git
-chmod 700 $PWD/.ssh/*
-eval `ssh-agent -s`
-ssh-add $PWD/.ssh/*.key
-git remote set-url origin git+ssh://git@github.com/rsbyrne/mobility-aus
+bash configure_ssh.sh
+eval "$(ssh-agent)"
+ssh-add ~/.ssh/*.pem
+git config --global user.email "rohan.byrne@gmail.com"
+git config --global user.name "rsbyrne"
 git add .
-git commit -m "Automatic push."
-git fetch
-git merge -m "Automatic merge."
+git commit -m "Quick push"
 git push
-sudo chown -R ubuntu $PWD/.git
-sudo chgrp -R ubuntu $PWD/.git
 cd $currentDir
