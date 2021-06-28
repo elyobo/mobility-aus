@@ -1,4 +1,6 @@
 data/
 resources/
 everest/
+cache/
 *.pem
+.credentials.txt

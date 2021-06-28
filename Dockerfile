@@ -31,6 +31,10 @@ RUN pip3 install -U --no-cache-dir \
   Flask \
   selenium
 
+RUN pip3 install -U --no-cache-dir \
+  tables \
+  pyarrow
+
 # Finish
 RUN apt update -y && apt upgrade -y
 

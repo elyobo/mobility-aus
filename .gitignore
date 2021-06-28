@@ -1,7 +1,9 @@
 data/
 everest/
 resources/
+cache/
 *.pem
+.credentials.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
