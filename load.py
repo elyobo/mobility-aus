@@ -8,6 +8,7 @@ import sys
 from glob import glob as glob
 from datetime import datetime as datetime, timezone as timezone
 from collections.abc import Sequence
+from functools import partial, lru_cache
 
 import pandas as pd
 from dask import dataframe as daskdf
@@ -21,8 +22,8 @@ df = pd.DataFrame
 import geopandas as gpd
 gdf = gpd.GeoDataFrame
 
-import aliases
 from utils import update_progressbar
+import aliases
 
 REPOPATH = os.path.dirname(__file__)
 
@@ -41,20 +42,6 @@ def datetime_str_from_datafilename(fname):
 def datafilename_to_datetime(fname):
     name = datetime_str_from_datafilename(fname)
     return process_datetime(name)
-
-def aggregate_tiles(frm):
-    print("\nAggregating tiles...")
-    indexkeys = frm.index.names
-    frm = frm.reset_index()
-    nonnkeys = [key for key in frm.columns if not key == 'n']
-    nsums = frm.groupby(nonnkeys)['n'].sum()
-    frm = frm.set_index(nonnkeys)
-    frm['n'] = nsums
-    frm = frm[~frm.index.duplicated()]
-    frm = frm.reset_index()
-    frm = frm.set_index(indexkeys)
-    print("Tiles aggregated.")
-    return frm
 
 
 class FBDataset:
@@ -134,7 +121,7 @@ class FBDataset:
     def make_blank(self):
         return pd.DataFrame(
             columns = (keys := self.KEEPKEYS)
-            ).set_index(keys[:3])
+            ).set_index(keys[:-1])['n']
     @property
     def frm(self):
         try:
@@ -164,14 +151,16 @@ class FBDataset:
             )
         frm['datetime'] = dtime
         frm['datetime'] = frm['datetime'].dt.tz_convert(self.timezone)
-        frm = frm.set_index(['datetime', 'quadkey', 'end_key'])
+        frm['km'] = frm['km'] > 0
+        frm = frm.set_index(['datetime', 'quadkey', 'end_key', 'km'])
         frm = frm.sort_index()
+        frm = frm['n']
+        frm = frm.groupby(level = frm.index.names).sum()
         return frm
 
     def update_frm(self, new):
         frm = self.frm
         frm = pd.concat([frm, new]).sort_index()
-        frm = aggregate_tiles(frm)
         self._prefrm = frm
         frm.to_pickle(self.prepath)
 
@@ -242,6 +231,153 @@ class FBDataset:
             return self.frm
         assert False
 
+@lru_cache
+def get_fb_loader(region):
+    return FBDataset(region)
+    
+def load_fb(region, sample = ...):
+    return get_fb_loader(region)[sample]
+
+
+class ABSSA:
+
+    STATENAMES = {
+        'vic': 'Victoria',
+        'nsw': 'New South Wales',
+        'qld': 'Queensland',
+        'sa': 'South Australia',
+        'wa': 'Western Australia',
+        'tas': 'Tasmania',
+        'nt': 'Northern Territory',
+        'act': 'Australian Capital Territory',
+        'oth': 'Other Territories',
+        }
+
+    GCCNAMES = {
+        'mel': 'Greater Melbourne',
+        'syd': 'Greater Sydney'
+        }    
+
+    __slots__ = ('_frm', 'name', 'filename', 'level', 'region', '_region')
+
+    def __init__(self, level = 2, region = None):
+        self.level = level
+        if not 2 <= level <= 4:
+            raise ValueError
+        if region is None:
+            self.region = None
+            self._region = None
+        else:
+            self.region = region
+            if region in (states := self.STATENAMES):
+                self._region = ('state', states[region])
+            elif region in (gccs := self.GCCNAMES):
+                self._region = ('gcc', gccs[region])
+        name = self.name = f"abs_sa_{level}"
+        if not region is None:
+            name += '_' + region
+        self.filename = os.path.join(aliases.cachedir, name) + '.pkl'
+
+    def get_frm(self):
+        try:
+            return self._frm
+        except AttributeError:
+            pass
+        try:
+            return pd.read_pickle(self.filename)
+        except FileNotFoundError:
+            pass
+        out = self.make_frm()
+        self._frm = out
+        out.to_pickle(self.filename)
+        return out
+
+    def make_basic_frm(self):
+
+        frm = gpd.read_file(os.path.join(
+            aliases.resourcesdir,
+            'SA2_2016_AUST.shp'
+            ))
+
+        pop = pd.read_csv(os.path.join(
+            aliases.resourcesdir,
+            'ABS_ANNUAL_ERP_ASGS2016_29062021113341414.csv',
+            ))
+        pop = pop.loc[pop['REGIONTYPE'] == 'SA2']
+        pop = pop.loc[pop['Region'] != 'Australia']
+        pop = pop.loc[pop['Region'] != 'Australia']
+        pop = pop[['Region', 'Value']].set_index('Region')['Value']
+
+        frm['pop'] = frm['SA2_NAME16'].apply(lambda x: pop.loc[x])
+
+        frm = frm.drop('SA2_5DIG16', axis = 1)
+        frm = frm.rename(dict(
+            AREASQKM16 = 'area',
+            SA2_MAIN16 = 'SA2_CODE16',
+            GCC_NAME16 = 'gcc',
+            STE_NAME16 = 'state',
+            ), axis = 1)
+
+        frm = frm.dropna()
+
+        if not (region := self._region) is None:
+            colname, val = region
+            frm = frm.loc[frm[colname] == val]
+
+        return frm
+
+    def make_frm(self):
+
+        frm = self.make_basic_frm()
+
+        level = self.level
+        for i in range(3, min(level + 1, 5)):
+            dropcols = [col for col in frm.columns if col.startswith(f"SA{i - 1}")]
+            frm = frm.drop(dropcols, axis = 1)
+            aggfuncs = dict(
+                geometry = shapely.ops.unary_union,
+                pop = sum,
+                area = sum,
+                )
+#             passkeys = [
+#                 *[key for key in frm.columns if key.startswith('GCC')],
+#                 *[key for key in frm.columns if key.startswith('STE')],
+#                 ]
+#             aggfuncs.update({key: lambda x: x.iloc[0] for key in passkeys})
+            agg = frm.groupby(f'SA{i}_CODE16').aggregate(aggfuncs)
+            frm = frm.set_index(f'SA{i}_CODE16')
+            frm[list(aggfuncs)] = agg
+            frm = frm.drop_duplicates()
+            frm = frm.reset_index()
+        keepcols = ['geometry', 'pop', 'area', 'gcc', 'state']
+        keepcols.extend(col for col in frm.columns if col.startswith(f'SA{level}'))
+        frm = frm[keepcols]
+        frm = frm.rename({
+            f"SA{level}_CODE16": 'code',
+            f"SA{level}_NAME16": 'name',
+            }, axis = 1)
+        frm['code'] = frm['code'].astype(int)
+        frm = frm.set_index('code')
+
+        if not (region := self.region) is None:
+            frm = frm.drop('state', axis = 1)
+            if region in self.GCCNAMES:
+                frm = frm.drop('gcc', axis = 1)
+        
+        return frm
+
+    @property
+    def frm(self):
+        return self.get_frm()
+
+@lru_cache
+def get_sa_loader(level, region = None):
+    return ABSSA(level, region)
+    
+def load_sa(level, region = None):
+    return get_sa_loader(level, region).frm
+
+
 STATENAMES = {
     'vic': 'Victoria',
     'nsw': 'New South Wales',
@@ -258,15 +394,6 @@ GCCNAMES = {
     'mel': 'Greater Melbourne',
     'syd': 'Greater Sydney'
     }
-
-
-def load_generic(option, **kwargs):
-    optionsDict = {
-        'lga': load_lgas,
-        'sa2': lambda: load_SA(2),
-        'postcodes': load_postcodes,
-        }
-    return optionsDict[option](**kwargs)
 
 def load_lgas():
     paths = [aliases.resourcesdir, 'LGA_2019_AUST.shp']
@@ -298,30 +425,6 @@ def load_aus():
     ausPoly = ausFrame.iloc[0]['geometry']
     return ausPoly
 
-def load_SA(level):
-    name = 'SA{0}_2016_AUST.shp'.format(str(level))
-    if level in {4, 3}: keyRoot = 'SA{0}_CODE16'
-    elif level in {2, 1}: keyRoot = 'SA{0}_MAIN16'
-    else: raise ValueError
-    key = keyRoot.format(str(level))
-    paths = [aliases.resourcesdir, name]
-    frm = gpd.read_file(os.path.join(*paths))
-    intCols = ['STE_CODE16', 'SA4_CODE16']
-    if level < 4: intCols.append('SA3_CODE16')
-    if level < 3: intCols.extend(['SA2_5DIG16', 'SA2_MAIN16'])
-    if level < 2: intCols.extend(['SA1_7DIG16', 'SA1_MAIN16'])
-    for intCol in intCols: frm[intCol] = frm[intCol].astype(int)
-    frm = frm.set_index(key)
-    frm = frm.loc[frm['AREASQKM16'] > 0.]
-    frm = frm.dropna()
-    frm['name'] = frm['SA{0}_NAME16'.format(str(level))]
-    frm['area'] = frm['AREASQKM16']
-    return frm
-def load_SA4(): return load_SA(4)
-def load_SA3(): return load_SA(3)
-def load_SA2(): return load_SA(2)
-def load_SA1(): return load_SA(1)
-
 def load_states(trim = True):
     paths = [aliases.resourcesdir, 'STE_2016_AUST.shp']
     frm = gpd.read_file(os.path.join(*paths))
@@ -339,7 +442,7 @@ def load_vic(): return load_state('vic')
 def load_nsw(): return load_state('nsw')
 def load_qld(): return load_state('qld')
 def load_nt(): return load_state('nt')
-def load_sa(): return load_state('sa')
+# def load_sa(): return load_state('sa')
 def load_act(): return load_state('act')
 def load_wa(): return load_state('wa')
 def load_tas(): return load_state('tas')
@@ -433,21 +536,21 @@ def load_gccs():
         return frm
     return make_gccs()
 
-def make_gccs():
-    sa4 = load_SA4()
-    gccs = sorted(set(sa4['GCC_NAME16']))
-    geoms = []
-    for gcc in gccs:
-        region = shapely.ops.unary_union(
-            sa4.set_index('GCC_NAME16').loc[gcc]['geometry']
-            )
-        region = region.buffer(np.sqrt(region.area) * 1e-4)
-        geoms.append(region)
-    frm = gdf(gccs, columns = ['gcc'], geometry = geoms)
-    frm = frm.set_index('gcc')
-    savePath = os.path.join(aliases.resourcesdir, 'gcc.shp')
-    frm.to_file(savePath)
-    return frm
+# def make_gccs():
+#     sa4 = load_SA4()
+#     gccs = sorted(set(sa4['GCC_NAME16']))
+#     geoms = []
+#     for gcc in gccs:
+#         region = shapely.ops.unary_union(
+#             sa4.set_index('GCC_NAME16').loc[gcc]['geometry']
+#             )
+#         region = region.buffer(np.sqrt(region.area) * 1e-4)
+#         geoms.append(region)
+#     frm = gdf(gccs, columns = ['gcc'], geometry = geoms)
+#     frm = frm.set_index('gcc')
+#     savePath = os.path.join(aliases.resourcesdir, 'gcc.shp')
+#     frm.to_file(savePath)
+#     return frm
 
 def load_region(region, fromLGAs = False):
     if fromLGAs:
@@ -464,6 +567,10 @@ def load_region(region, fromLGAs = False):
             return load_gcc(region)
         else:
             raise ValueError
+
+def load_generic(option, **kwargs):
+    return ABSLOADERS[option](**kwargs)
+
 
 def load_seifa():
 
@@ -515,6 +622,7 @@ def load_seifa():
     seifa = seifa.set_index('code')
 
     return seifa
+
 
 
 ###############################################################################

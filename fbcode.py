@@ -119,6 +119,7 @@ def wait_check(
         waitInterval = 1.,
         maxWait = None
         ):
+    print(f"Waiting (max = {maxWait})...")
     waited = 0.
     while not condition():
         if not message is None:
@@ -136,6 +137,7 @@ def wait_check(
                     repeatAction()
                 except:
                     pass
+    print("Waiting over.")
 
 
 # from PIL import Image as PILImage

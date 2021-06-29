@@ -13,4 +13,7 @@ with open(os.path.join(repoPath, '.credentials.txt'), 'r') as f:
     loginName, loginPass = f.read().strip('\n').split(' ')
 
 # fbids = fbids[:1]
+# fbids = fbids[-1:]
+print(f"Pulling fbids {fbids}...")
 fbcode.pull_datas(fbids, loginName, loginPass)
+print("Pulled.")

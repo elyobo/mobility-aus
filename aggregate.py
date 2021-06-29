@@ -19,14 +19,18 @@ import load
 from utils import update_progressbar
 
 
-def quadkeys_to_poly(quadkeys):
-    quadkeys = sorted(set(quadkeys))
-    tiles = [mercantile.quadkey_to_tile(qk) for qk in quadkeys]
-    tiles = mercantile.simplify(tiles)
-    quadkeys = [mercantile.quadkey(t) for t in tiles]
-    polys = quadkeys_to_polys(quadkeys)
-    poly = shapely.ops.unary_union(polys)
+def quadkey_to_poly(quadkey):
+    x0, y0, x1, y1 = mercantile.bounds(
+        mercantile.quadkey_to_tile(quadkey)
+        )
+    poly = shapely.geometry.Polygon(
+        [[x0, y0], [x0, y1], [x1, y1], [x1, y0]]
+        )
     return poly
+
+def quadkeys_to_polys(quadkeys):
+    quadDict = {q: quadkey_to_poly(q) for q in sorted(set(quadkeys))}
+    return [quadDict[q] for q in quadkeys]
 
 def make_quadkeypairs(fbdata):
     out = fbdata.reset_index()[['quadkey', 'end_key']]
@@ -39,7 +43,6 @@ def make_quadfrm(quadkeys):
     quadFrm = gdf(geometry = quadpolys, index = quadkeys)
     quadFrm.index.name = 'quadkey'
     return quadFrm
-
 
 def make_intersection_weights(fromFrm, toFrm):
     joined = gpd.tools.sjoin(fromFrm, toFrm, 'left', 'intersects')
@@ -69,6 +72,7 @@ def split_iterate(frm):
         for start, stop, weight in journeys:
             yield *row, start, stop, weight
     print("Frame split.")
+
 def split_journeys(frm):
     frm = frm.reset_index()
     iterator = split_iterate(frm)
@@ -82,25 +86,39 @@ def split_journeys(frm):
 
 class SpatialAggregator:
 
-    __slots__ = ('aggtype', 'diskpath')
 
-    def __init__(self, aggtype = 'lga'):
+
+    __slots__ = ('aggtype', 'region', 'name', 'filepath')
+
+    def __init__(self, aggtype = 'lga', region = None):
         self.aggtype = aggtype
-        self.diskpath = os.path.join(aliases.cachedir, f"quadweights_{aggtype}.pkl")
+        self.region = region
+        name = f"quadweights_{aggtype}"
+        if not region is None:
+            name += '_' + region
+        name += '.pkl'
+        self.name = name
+        self.filepath = os.path.join(aliases.cachedir, name)
 
     @property
     def weights(self):
         try:
-            with open(self.diskpath, mode = 'rb') as file:
+            with open(self.filepath, mode = 'rb') as file:
                 return pickle.loads(file.read())
         except FileNotFoundError:
             return dict()
     def store(self, tostore):
-        with open(self.diskpath, mode = 'wb') as file:
+        with open(self.filepath, mode = 'wb') as file:
             file.write(pickle.dumps(tostore))
     @property
     def tofrm(self):
-        return load.load_generic(self.aggtype)
+        aggtype = self.aggtype
+        if aggtype.startswith('sa'):
+            level = int(aggtype[-1])
+            return load.load_sa(level, self.region)
+        if aggtype == 'lga':
+            return load.load_lgas()
+        raise ValueError(aggtype)
 
     def get_quadkey_weights(self, quadkeys):
         print("Getting quadkey weights...")
@@ -122,11 +140,12 @@ class SpatialAggregator:
             return self[[arg,]][arg]
         if isinstance(arg, (Sequence, set)):
             return self.get_quadkey_weights(arg)
-        if isinstance(arg, pd.DataFrame):
+        if isinstance(arg, (pd.DataFrame, pd.Series)):
             return self[set((
                 *arg.index.get_level_values('quadkey'),
                 *arg.index.get_level_values('end_key'),
                 ))]
+        raise TypeError(type(arg))
 
     @staticmethod
     def _poss_journey_groupfunc(x):
@@ -163,6 +182,11 @@ class SpatialAggregator:
         print(f"Aggregating to {self.aggtype}...")
         frm = self.add_possible_journeys(frm)
         frm = split_journeys(frm)
+        frm['n'] = frm['n'] * frm['weight']
+        frm = frm.drop('weight', axis = 1)
+        keepkeys = ['datetime', 'start', 'stop', 'km']
+        frm = frm.reset_index().set_index(keepkeys)['n']
+        frm = frm.groupby(frm.index.names).aggregate(sum)
         print("Aggregated.")
         return frm
 
@@ -170,20 +194,32 @@ class SpatialAggregator:
         return self.aggregate(frm)
 
 
-def combine_by_date(frm):
-    print("Combining dates...")
+def split_datetimes(frm):
+    print("Splitting datetimes...")
     indexnames = frm.index.names
     frm = frm.reset_index()
     frm['date'] = frm['datetime'].apply(lambda x: x.date)
     frm['time'] = frm['datetime'].apply(lambda x: x.time)
     frm = frm.drop('datetime', axis = 1)
-    frm = frm.set_index(['date', *indexnames[1:]])
-    print("Dates combined.")
+    frm = frm.set_index(['date', 'time', 'start', 'stop', 'km'])['n']
+    print("Splitting datetimes.")
+    return frm
+
+def combine_by_date(frm):
+    print("Combining by date...")
+    frm = split_datetimes(frm)
+    frm = frm.groupby(level = ('date', 'start', 'stop', 'km')).sum()
+    print("Combined.")
     return frm
 
 
-def aggregate(frm, aggtype = 'lga'):
-    return combine_by_date(SpatialAggregator(aggtype)(frm))
+def aggregate(frm, aggtype = 'lga', region = None):
+    print("Aggregating spatially and temporally...")
+    spatialaggregator = SpatialAggregator(aggtype, region)
+    spatialagg = spatialaggregator(frm)
+    out = combine_by_date(spatialagg)
+    print("Spatiotemporally aggregated.")
+    return out
 
 
 ###############################################################################
