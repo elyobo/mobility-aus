@@ -18,7 +18,7 @@ from everest import window
 
 def melsummary_plot():
 
-    frm = get.get_aggregated_data('vic', aggtype = 'sa4')
+    frm = get.get_aggregated_data('vic', aggtype = 'sa4', refresh = True)
     metro = load.load_sa(4, 'mel')
     frm = frm.loc[idx[:], metro.index]
     # frm = frm.loc['2021-01-01':]

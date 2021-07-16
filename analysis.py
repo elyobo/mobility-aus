@@ -3,10 +3,13 @@
 
 
 import re
+from datetime import datetime
+from scipy import interpolate as sp_interp
 
 import pandas as pd
 
 import aliases
+import utils
 
 
 def mobile_proportion(frm):
@@ -15,27 +18,46 @@ def mobile_proportion(frm):
     mobsums = xs.groupby(level = ('date', 'start')).sum()
     return mobsums / nsums
 
-def calculate_day_scores(series, level = 'date', n = 4):
-    '''
-    Takes a series indexed by date
-    and returns normalised values grouped by date.
-    '''
-    index = series.index.get_level_values(level)
-    series = pd.DataFrame(data = dict(
-        val = series.values,
-        date = index,
-        day = [int(d.strftime('%w')) for d in index.tolist()]
-        )).set_index([level, 'day'])['val']
-    groups = series.groupby(level = 'day')
-    highs = groups.apply(lambda s: s.nlargest(n).mean())
-    lows = groups.apply(lambda s: s.nsmallest(n).mean())
-    series = (series - lows) / (highs - lows)
-    series = pd.Series(series.values, index)
-    return series
+PUBLICHOLIDAYS = dict(
+    vic = dict((datetime(*date), label) for date, label in (
+        ((2020, 1, 1), "New Year's Day"),
+        ((2020, 1, 27), "Australia Day"),
+        ((2020, 3, 9), "Labour Day"),
+        ((2020, 4, 10), "Good Friday"),
+        ((2020, 4, 11), "Saturday before Easter Sunday"),
+        ((2020, 4, 12), "Easter Sunday"),
+        ((2020, 4, 13), "Easter Monday"),
+        ((2020, 4, 25), "Anzac Day"),
+        ((2020, 6, 8), "Queen's Birthday"),
+        ((2020, 10, 23), "Friday before the AFL Grand Final"),
+        ((2020, 11, 3), "Melbourne Cup"),
+        ((2020, 12, 25), "Christmas Day"),
+        ((2020, 12, 26), "Boxing Day"),
+        ((2020, 12, 28), "Boxing Day Compensation"),
+        ((2021, 1, 1), "New Year's Day"),
+        ((2021, 1, 26), "Australia Day"),
+        ((2021, 3, 8), "Labour Day"),
+        ((2021, 4, 2), "Good Friday"),
+        ((2021, 4, 3), "Saturday before Easter Sunday"),
+        ((2021, 4, 4), "Easter Sunday"),
+        ((2021, 4, 5), "Easter Monday"),
+        ((2021, 4, 25), "Anzac Day"),
+        ((2021, 6, 14), "Queen's Birthday"),
+        ((2021, 9, 24), "Friday before the AFL Grand Final"),
+        ((2021, 11, 2), "Melbourne Cup"),
+        ((2021, 12, 25), "Christmas Day"),
+        ((2021, 12, 27), "Christmas Day Compensation"),
+        ((2021, 12, 28), "Boxing Day Compensation"),
+        ))
+    )
 
 MELVIC_ANNOTATIONS = [
-#     ('2020-04-25', 'Anzac Day', (0, -30)),
-#     ('2020-05-13', 'Easing', (0, -30)),
+#     ('2020-02-27', 'Emergency\ndeclared', (0, -45)),
+#     ('2020-03-09', 'Labour\nDay', (0, -30)),
+    ('2020-03-13', 'First\nlockdown', (30, 30)),
+    ('2020-04-21', 'Easter', (0, 30)),
+    ('2020-04-25', 'Anzac Day', (0, -30)),
+    ('2020-05-13', 'Easing', (0, -30)),
     ('2020-05-31', 'Cafes\nreopen', (0, 30)),
     ('2020-06-08', "Queen's\nBirthday", (0, -30)),
     ('2020-06-26', 'School\nholidays', (-30, 30)),
@@ -49,9 +71,9 @@ MELVIC_ANNOTATIONS = [
     ('2020-09-27', 'Second\nStep', (0, -30)),
     ('2020-10-11', 'Picnics\nallowed', (-30, 30)),
     ('2020-10-18', 'Travel\nrelaxed', (0, 30)),
-    ('2020-10-23', 'Grand Final\nholiday', (0, -30)),
+    ('2020-10-23', 'Grand Final\nholiday', (-15, -30)),
     ('2020-10-28', 'Third\nStep', (0, 30)),
-    ('2020-11-03', 'Cup Day', (0, -30)),
+    ('2020-11-03', 'Cup Day', (15, -45)),
     ('2020-11-08', 'Ring of Steel\nends', (0, 45)),
     ('2020-11-22', 'Last\nStep', (0, -30)),
     ('2020-12-06', 'COVIDSafe\nSummer', (0, 45)),
@@ -69,9 +91,36 @@ MELVIC_ANNOTATIONS = [
     ('2021-06-14', "Queen's\nBirthday", (15, -30)),
     ]
 
-def remove_brackets(x):
-    # Remove brackets from ABS council names:
-    return re.sub("[\(\[].*?[\)\]]", "", x).strip()
+def get_days(datetimes, state):
+    global PUBLICHOLIDAYS
+    return [
+        7 if d in PUBLICHOLIDAYS['vic'] else int(d.strftime('%w'))
+            for d in datetimes
+        ]
+
+def calculate_day_scores(inp, state, n = 4):
+    '''
+    Takes a dataframe indexed by date
+    and returns normalised values grouped by date.
+    '''
+    frm = inp.reset_index()
+    frm['day'] = get_days(frm['date'], state)
+    frm = frm.set_index([*inp.index.names, 'day'])
+    procserieses = []
+    for name, series in frm.iteritems():
+        groups = series.groupby(level = 'day')
+        highs = groups.apply(lambda s: s.nlargest(n).median())
+        lows = groups.apply(lambda s: s.nsmallest(n).median())
+        series = (series - lows) / (highs - lows)
+        series = pd.Series(series.values, inp.index, name = name)
+        procserieses.append(series)
+    frm = pd.DataFrame(
+        dict(zip(frm.columns, procserieses)),
+        inp.index,
+        )
+    if isinstance(inp, pd.Series):
+        return frm[inp.name]
+    return frm
 
 def detect_american_dates(dates):
     months = sorted(set([date.split('-')[0] for date in dates]))
@@ -102,7 +151,7 @@ def get_gov_covid_data(agg = 'lga', region = 'vic'):
     cases = cases.loc[cases['name'] != 'Overseas']
     cases = cases.loc[cases['name'] != 'Interstate']
     cases = cases.sort_index()
-    cases['name'] = cases['name'].apply(remove_brackets)
+    cases['name'] = cases['name'].apply(utils.remove_brackets)
     cases['mystery'] = cases['source'] == 'Acquired in Australia, unknown source'
     dropagg = tuple(v for v in aggchoices.values() if not v == agg)
     cases = cases.drop(['source', *dropagg], axis = 1)
@@ -147,6 +196,38 @@ def make_casesFrm_gov(region = 'vic', agg = 'lga'):
     cases = cases.drop('pop', axis = 1)
 
     return cases
+
+
+def strip_googlename(googlename):
+    name = googlename
+    name = name.removeprefix("The").removeprefix('the').strip()
+    for word in ('Shire', 'Council', 'City', 'Region', 'Municipal', 'Regional'):
+        name = name.removeprefix(word).strip()
+        name = name.removeprefix('of').strip()
+        name = name.removesuffix(word).strip()
+    if name == googlename:
+        return name
+    return strip_googlename(name)
+
+def match_googlename_to_lgas(googlename, lganames):
+    stripped = strip_googlename(googlename)
+    for lganame in lganames:
+        if stripped in lganame:
+            return lganame
+
+def match_googlenames_to_lgas(googlenames, lganames):
+    return dict(zip(
+        googlenames,
+        (match_googlename_to_lgas(name, lganames) for name in googlenames),
+        ))
+
+def process_googlenames(frm):
+    lgas = load_lgas()
+    namemap = match_googlenames_to_lgas(
+        sorted(set(frm.index.levels[1])),
+        sorted(lgas['name']),
+        )
+    frm['name'] = frm['name'].apply(namemap.__getitem__)
 
 
 ###############################################################################

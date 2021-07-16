@@ -4,6 +4,7 @@
 
 
 import sys
+import re
 
 
 def update_progressbar(i, n):
@@ -13,6 +14,10 @@ def update_progressbar(i, n):
     sys.stdout.write('\r')
     sys.stdout.write(f"[{prog * '#'}{(50 - prog) * '.'}]")
     sys.stdout.flush()
+
+def remove_brackets(x):
+    # Remove brackets from ABS council names:
+    return re.sub("[\(\[].*?[\)\]]", "", x).strip()
 
 
 ###############################################################################

@@ -86,8 +86,6 @@ def split_journeys(frm):
 
 class SpatialAggregator:
 
-
-
     __slots__ = ('aggtype', 'region', 'name', 'filepath')
 
     def __init__(self, aggtype = 'lga', region = None):
@@ -127,7 +125,7 @@ class SpatialAggregator:
         tocalc = [key for key in quadkeys if not key in weights]
         if not tocalc:
             print("Quadkey weights retrieved.")
-            return weights
+            return {key: weights[key] for key in quadkeys}
         quadfrm = make_quadfrm(tocalc)
         newweights = make_intersection_weights(quadfrm, self.tofrm)
         weights.update(newweights)
@@ -178,8 +176,7 @@ class SpatialAggregator:
         print(f"Added possible journeys.")
         return frm
 
-    def aggregate(self, frm):
-        print(f"Aggregating to {self.aggtype}...")
+    def possible_journeys(self, frm):
         frm = self.add_possible_journeys(frm)
         frm = split_journeys(frm)
         frm['n'] = frm['n'] * frm['weight']
@@ -187,6 +184,23 @@ class SpatialAggregator:
         keepkeys = ['datetime', 'start', 'stop', 'km']
         frm = frm.reset_index().set_index(keepkeys)['n']
         frm = frm.groupby(frm.index.names).aggregate(sum)
+        return frm
+
+    def majority_region(self, frm):
+        weights = self[frm]
+        weights = {
+            key: sorted(weight, key = lambda x: x[-1])[-1][0]
+                for key, weight in weights.items()
+            }
+        frm = frm.reset_index()
+        frm['start'] = frm['quadkey'].apply(lambda x: weights[x])
+        frm['stop'] = frm['end_key'].apply(lambda x: weights[x])
+        frm = frm.set_index(['datetime', 'start', 'stop', 'km'])['n']
+        return frm
+
+    def aggregate(self, frm):
+        print(f"Aggregating to {self.aggtype}...")
+        frm = self.majority_region(frm)
         print("Aggregated.")
         return frm
 
