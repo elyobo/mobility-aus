@@ -19,6 +19,12 @@ def remove_brackets(x):
     # Remove brackets from ABS council names:
     return re.sub("[\(\[].*?[\)\]]", "", x).strip()
 
+def reverse_multidict(indict):
+    rev = {}
+    for key, value in indict.items():
+        rev.setdefault(value, set()).add(key)
+    return rev
+
 
 ###############################################################################
 ###############################################################################

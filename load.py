@@ -10,6 +10,7 @@ from datetime import datetime as datetime, timezone as timezone
 from collections.abc import Sequence
 from functools import partial, lru_cache
 import requests, zipfile, io
+import pickle
 
 import pandas as pd
 from dask import dataframe as daskdf
@@ -24,6 +25,7 @@ import geopandas as gpd
 gdf = gpd.GeoDataFrame
 
 from utils import update_progressbar
+import utils
 import aliases
 
 REPOPATH = os.path.dirname(__file__)
@@ -40,6 +42,21 @@ STATENAMES = {
     'act': 'Australian Capital Territory',
     'oth': 'Other Territories',
     }
+
+GCCNAMES = {
+    'mel': 'Greater Melbourne',
+    'syd': 'Greater Sydney'
+    }
+
+GCCSTATES = {
+    'mel': 'vic',
+    'syd': 'nsw',
+    }
+
+def get_state(region):
+    return (
+        STATENAMES[region if region in STATENAMES else GCCSTATES[region]]
+        )
 
 
 def process_datetime(x):
@@ -258,18 +275,29 @@ def download_zip(zipurl, destination):
     z = zipfile.ZipFile(io.BytesIO(r.content))
     z.extractall(destination)
 
-def load_google(state = None, update = False):
+@lru_cache
+def load_googlenames():
+    path = os.path.join(aliases.resourcesdir, 'googlenames.pkl')
+    with open(path, mode = 'rb') as file:
+        return pickle.load(file)
+
+@lru_cache
+def load_google(region = None, update = False):
+
     if update:
         download_zip(
-            "https://www.gstatic.com/covid19/mobility/Region_Mobility_Report_CSVs.zip",
+            ("https://www.gstatic.com/covid19/mobility/"
+            "Region_Mobility_Report_CSVs.zip"),
             os.path.join(aliases.datadir, 'google')
             )
+
     frm2020 = pd.read_csv(os.path.join(
         aliases.datadir, 'google', '2020_AU_Region_Mobility_Report.csv'
         ))
     frm2021 = pd.read_csv(os.path.join(
         aliases.datadir, 'google', '2021_AU_Region_Mobility_Report.csv'
         ))
+
     frm = pd.concat([frm2020, frm2021])
     frm = frm.drop(
         ['country_region_code', 'country_region', 'place_id',
@@ -277,13 +305,37 @@ def load_google(state = None, update = False):
         axis = 1
         )
     frm = frm.dropna()
-    frm = frm.rename(dict(sub_region_1 = 'state', sub_region_2 = 'name'), axis = 1)
+    frm = frm.rename(dict(
+        sub_region_1 = 'state', sub_region_2 = 'name'
+        ), axis = 1)
     frm['date'] = frm['date'].apply(pd.to_datetime)
-    frm = frm.set_index(['date', 'name'])
-    if not state is None:
-        global STATENAMES
-        state = STATENAMES[state]
+
+    googlenames = load_googlenames()
+    frm['name'] = frm['name'].apply(googlenames.__getitem__)
+
+    if region is None:
+        frm = frm.set_index(['date', 'state', 'name'])
+    else:
+        global STATENAMES, GCCNAMES, GCCSTATES
+        ismetro = region in GCCNAMES
+        state = STATENAMES[region if not ismetro else GCCSTATES[region]]
         frm = frm.loc[frm['state'] == state].drop('state', axis = 1)
+        frm = frm.set_index(['date', 'name'])
+        if ismetro:
+            sa = load_sa(4, region)
+            gcc = sa.unary_union
+            lgas = load_lgas()
+            inters = lgas.within(gcc)
+            inters = sorted(inters.loc[inters].index)
+            frm = frm.loc[(slice(None), inters),]
+    frm = frm.sort_index()
+
+    dupeinds = frm.index.duplicated(False)
+    duplicateds = frm.iloc[dupeinds].sort_index()
+    agg = duplicateds.groupby(level = frm.index.names).mean()
+    frm = pd.concat([frm.loc[~dupeinds], agg])
+    frm = frm.sort_index()
+
     frm = frm.rename(dict(zip(
         frm.columns,
         (
@@ -291,6 +343,7 @@ def load_google(state = None, update = False):
                 for strn in frm.columns
             ),
         )), axis = 1)
+
     return frm
 
 
@@ -298,10 +351,7 @@ class ABSSA:
 
     STATENAMES = STATENAMES
 
-    GCCNAMES = {
-        'mel': 'Greater Melbourne',
-        'syd': 'Greater Sydney'
-        }    
+    GCCNAMES = GCCNAMES
 
     __slots__ = ('_frm', 'name', 'filename', 'level', 'region', '_region')
 
@@ -377,7 +427,9 @@ class ABSSA:
 
         level = self.level
         for i in range(3, min(level + 1, 5)):
-            dropcols = [col for col in frm.columns if col.startswith(f"SA{i - 1}")]
+            dropcols = [
+                col for col in frm.columns if col.startswith(f"SA{i - 1}")
+                ]
             frm = frm.drop(dropcols, axis = 1)
             aggfuncs = dict(
                 geometry = shapely.ops.unary_union,
@@ -395,14 +447,16 @@ class ABSSA:
             frm = frm.drop_duplicates()
             frm = frm.reset_index()
         keepcols = ['geometry', 'pop', 'area', 'gcc', 'state']
-        keepcols.extend(col for col in frm.columns if col.startswith(f'SA{level}'))
+        keepcols.extend(
+            col for col in frm.columns if col.startswith(f'SA{level}')
+            )
         frm = frm[keepcols]
         frm = frm.rename({
             f"SA{level}_CODE16": 'code',
             f"SA{level}_NAME16": 'name',
             }, axis = 1)
         frm['code'] = frm['code'].astype(int)
-        frm = frm.set_index('code')
+        frm = frm.set_index('name')
 
         if not (region := self.region) is None:
             frm = frm.drop('state', axis = 1)
@@ -446,7 +500,7 @@ def load_lgas():
         ))
     pops = pops[['Region', 'Value']].set_index('Region')['Value']
     lgas['pop'] = pops
-    lgas = lgas.reset_index().set_index('code')
+    lgas = lgas.reset_index().set_index('name')
     return lgas
 
 
@@ -471,16 +525,6 @@ def load_seifa():
         'pop',
         ]
 
-    import re
-    strip_names = lambda x: re.sub("[\(\[].*?[\)\]]", "", x).strip()
-    seifa['name'] = seifa['name'].apply(strip_names)
-
-    lgas = load_lgas()
-    statesDict = dict(zip(lgas.index.astype(str), lgas['STE_NAME16']))
-    seifa['state'] = seifa['code'].apply(
-        lambda x: statesDict[x] if x in statesDict else None
-        )
-
     for column in {
             'Index of Relative Socio-economic Disadvantage - Score',
             'Index of Relative Socio-economic Disadvantage - Decile',
@@ -497,10 +541,9 @@ def load_seifa():
         seifa = seifa.dropna()
         seifa[column] = seifa[column].astype(int)
 
-    seifa = seifa.set_index('code')
+    seifa = seifa.set_index('name')
 
     return seifa
-
 
 
 ###############################################################################
