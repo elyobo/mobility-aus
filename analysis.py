@@ -3,8 +3,9 @@
 
 
 import re
-from datetime import datetime
+import datetime
 import math
+import itertools
 
 from scipy import interpolate as sp_interp
 import pandas as pd
@@ -23,7 +24,7 @@ import load
 #     return mobsums / nsums
 
 PUBLICHOLIDAYS = dict(
-    vic = dict((datetime(*date), label) for date, label in (
+    vic = dict((datetime.datetime(*date), label) for date, label in (
         ((2020, 1, 1), "New Year's Day"),
         ((2020, 1, 27), "Australia Day"),
         ((2020, 3, 9), "Labour Day"),
@@ -53,7 +54,7 @@ PUBLICHOLIDAYS = dict(
         ((2021, 12, 27), "Christmas Day Compensation"),
         ((2021, 12, 28), "Boxing Day Compensation"),
         )),
-    nsw = dict((datetime(*date), label) for date, label in (
+    nsw = dict((datetime.datetime(*date), label) for date, label in (
         ((2020, 1, 1), "New Year's Day"),
         ((2020, 1, 27), "Australia Day"),
         ((2020, 4, 10), "Good Friday"),
@@ -82,25 +83,25 @@ PUBLICHOLIDAYS = dict(
     )
 
 COVIDMEASURES = dict(
-    vic = dict((datetime(*date), label) for date, label in (
+    vic = dict((datetime.datetime(*date), label) for date, label in (
         ((2020, 3, 13), "First lockdown"),
         ((2020, 5, 13), "Easing"),
         ((2020, 5, 31), "Cafes reopen"),
         ((2020, 6, 30), "Postcode lockdowns"),
         ((2020, 7, 8), "Stage 3"),
-        ((2020, 7, 19), "Mask mandate"),
+        ((2020, 7, 18), "Mask mandate"),
         ((2020, 8, 2), "Stage 4"),
         ((2020, 8, 6), "Business closures"),
-        ((2020, 9, 6), "Roadmap plan"),
+#         ((2020, 9, 6), "Roadmap plan"),
         ((2020, 9, 13), "First step"),
         ((2020, 9, 27), "Second step"),
         ((2020, 10, 11), "Picnics allowed"),
-        ((2020, 10, 18), "Travel relaxed"),
+#         ((2020, 10, 18), "Travel relaxed"),
         ((2020, 10, 28), "Third step"),
         ((2020, 11, 8), "Ring of Steel ends"),
         ((2020, 11, 22), "Last step"),
         ((2020, 12, 6), "COVIDSafe Summer"),
-        ((2021, 2, 13), "Circuit breaker"),
+        ((2021, 2, 15), "Circuit breaker"),
         ((2021, 5, 11), "Wollert cluster"),
         ((2021, 5, 28), "Fourth lockdown"),
         ((2021, 6, 11), "Easing"),
@@ -167,43 +168,49 @@ def calculate_day_scores(inp, region, n = 4):
         return frm[inp.name]
     return frm
 
-def make_scorefrm(frm, region, n = 4):
+def make_avfrm(frm):
+    avfrm = calculate_averages(frm)
+    avfrm['name'] = 'average'
+    avfrm = avfrm.reset_index().set_index(frm.index.names)
+    return avfrm
 
-    lgas = load.load_lgas()
-
+def make_seifaavs(frm):
     seifa = load.load_seifa()
     seifa = seifa['Index of Relative Socio-economic Disadvantage - Score']
-    indices = set(frm.index.levels[1]).intersection(seifa.index)
-    seifa = seifa.loc[indices]
+    seifa = seifa.loc[set(frm.index.levels[1]).intersection(seifa.index)]
     lowSE = seifa.nsmallest(math.floor(len(seifa) / 3))
     highSE = seifa.nlargest(math.floor(len(seifa) / 3))
     midSE = seifa.loc[[
         key for key in seifa.index
             if not (key in lowSE.index or key in highSE.index)
         ]]
-
-    anfrm = calculate_day_scores(frm, region, n = n)
-    anfrm['pop'] = list(lgas['pop'].loc[frm.index.get_level_values('name')])
-
-    avfrm = calculate_averages(anfrm)
-    avfrm['name'] = 'average'
-    avfrm = avfrm.reset_index().set_index(frm.index.names)
-
     seifaavs = []
     for name, se in zip(['lowSE', 'midSE', 'highSE'], [lowSE, midSE, highSE]):
         subnames = set(se.index).intersection(frm.index.levels[1])
-        subfrm = anfrm.loc[(slice(None), subnames),]
+        subfrm = frm.loc[(slice(None), subnames),]
         subavfrm = calculate_averages(subfrm)
         subavfrm['name'] = name
         subavfrm = subavfrm.reset_index().set_index(frm.index.names)
         seifaavs.append(subavfrm)
+    return pd.concat(seifaavs)
 
-    frm = pd.concat([anfrm, avfrm, *seifaavs])
+def make_scorefrm(frm, region, n = 4):
+
+    lgas = load.load_lgas()
+
+    anfrm = calculate_day_scores(frm, region, n = n)
+    anfrm['pop'] = list(lgas['pop'].loc[frm.index.get_level_values('name')])
+
+    avfrm = make_avfrm(anfrm)
+    seifafrm = make_seifaavs(anfrm)
+
+    frm = pd.concat([anfrm, avfrm, seifafrm])
     frm = frm.drop('pop', axis = 1)
     frm = frm.dropna()
     frm = frm.sort_index()
 
     return frm
+
 
 def detect_american_dates(dates):
     months = sorted(set([date.split('-')[0] for date in dates]))
@@ -213,7 +220,7 @@ def to_american_date(datestr):
     day, month, year = datestr.split('-')
     return '/'.join((month, day, year))
 
-def get_gov_covid_data(agg = 'lga', region = 'vic'):
+def get_gov_covid_data(region = 'vic', agg = 'lga'):
     aggchoices = dict(lga = 'name', postcode = 'postcode')
     agg = aggchoices[agg]
     url = 'https://www.dhhs.vic.gov.au/ncov-covid-cases-by-lga-source-csv'
@@ -247,9 +254,25 @@ def get_gov_covid_data(agg = 'lga', region = 'vic'):
 
 def make_casesFrm_gov(region = 'vic', agg = 'lga'):
 
-    cases = get_gov_covid_data()
+    if agg != 'lga':
+        raise Exception("Not supported yet.")
+    if region != 'vic':
+        raise Exception("Not supported yet.")
 
-    names = list(set(cases.index.get_level_values('name')))
+    cases = get_gov_covid_data(region, agg)
+
+    lgas = load.load_lgas()
+    lganames = sorted(set(lgas.index))
+    namesdict = dict(zip(
+        (utils.remove_brackets(nm) for nm in lganames),
+        lganames
+        ))
+
+    cases = cases.drop('Unknown', level = 'name')
+    cases = cases.reset_index()
+    cases['name'] = cases['name'].apply(namesdict.__getitem__)
+    cases = cases.set_index(['date', 'name']).sort_index()
+
     base = datetime.datetime(2020, 1, 1)
     days = []
     day = base
@@ -260,6 +283,7 @@ def make_casesFrm_gov(region = 'vic', agg = 'lga'):
     while day < maxday:
         days.append(day)
         day += datetime.timedelta(days = 1)
+    names = sorted(set(cases.index.get_level_values('name')))
     blank = pd.DataFrame(
         itertools.product(days, names, [0], [0]),
         columns = ('date', 'name', 'new', 'mystery')
@@ -267,23 +291,49 @@ def make_casesFrm_gov(region = 'vic', agg = 'lga'):
     blank = blank.set_index(['date', 'name'])
 
     blank[cases.columns] = cases
+    blank = blank.fillna(0)
     cases = blank
-    cases = cases.fillna(0)
 
-    lookup = make_sub_lookupFrm(region, 'lga')
-    popDict = dict(zip(lookup.index, lookup['pop']))
-    cases = cases.loc[(slice(None), popDict.keys()),]
-    cases['pop'] = [popDict[n] for n in cases.index.get_level_values('name')]
+    popdict = dict(zip(
+        lgas.index,
+        lgas['pop']
+        ))
+    cases['pop'] = [popdict[nm] for nm in cases.index.get_level_values('name')]
     cases['new'] = cases['new'] / cases['pop'] * 10000
-    cases['new_rolling'] = cases['new'].groupby(
-        level = 'name', group_keys = False
-        ).rolling(7).mean().sort_index()
-    cases['new_rolling'] = cases['new_rolling'].apply(
-        lambda s: 0 if s < 1e-3 else s
+    cases['mystery'] = cases['mystery'] / cases['pop'] * 10000
+
+    avfrm = make_avfrm(cases)
+    seifafrm = make_seifaavs(cases)
+
+    cases = pd.concat([cases, avfrm, seifafrm])
+
+    cases = cases.drop('pop', axis = 1).sort_index()
+
+    rolling = pd.concat([
+        cases[['new', 'mystery']].xs(
+                reg, level = 'name', drop_level = False
+                ).rolling(7).mean()
+            for reg in cases.index.levels[1]
+        ]).dropna().sort_index()
+    rolling = rolling.rename(
+        dict(new = 'new_rolling', mystery = 'mystery_rolling'),
+        axis = 1
         )
-    cases['cumulative'] = cases.groupby('name')['new'].cumsum()
-    cases = cases.dropna()
-    cases = cases.drop('pop', axis = 1)
+    cases[rolling.columns] = rolling
+
+    cumulative = pd.concat([
+        cases[['new', 'mystery']].xs(
+                reg, level = 'name', drop_level = False
+                ).cumsum()
+            for reg in cases.index.levels[1]
+        ]).dropna().sort_index()
+    cumulative = cumulative.rename(
+        dict(new = 'new_cumulative', mystery = 'mystery_cumulative'),
+        axis = 1
+        )
+    cases[cumulative.columns] = cumulative
+
+    cases = cases.dropna().sort_index()
 
     return cases
 
